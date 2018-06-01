@@ -1,0 +1,213 @@
+---
+title: "CourseProject"
+author: "ENM"
+date: "May 23, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+library(caret)
+library(ggplot2)
+library(lubridate)
+setwd("~/DATA/RESOURCES/ONLINE_COURSES/PRACTICAL_MACHINE_LEARNING/COURSE_PROJECT")
+```
+
+Load the data sets and create a list with all of them.
+NOTE: I created the list to simplify the data transformations needed for the models I built. All the original exploratory analysis was performed in the train data set and NOT in the validation or test data set.
+
+```{r echo=TRUE}
+train <- read.csv("pml-training.csv")
+test <- read.csv("pml-testing.csv")
+set.seed(5)
+inTrain <- createDataPartition(train$classe, p = .8)[[1]]
+validation <- train[-inTrain,]
+train <- train[inTrain,]
+
+l_d <- list(train, validation, test) 
+names(l_d) <- c("train", "validation", "test")
+```
+
+Keep only some variables (vars. without missing values and vars. that aren't summaries of others).
+
+```{r}
+nas <- sapply(train[1:dim(train)[2]], function(x){
+      sum(is.na(x))})
+nokeep <- c(names(nas[nas != 0]), 
+            grep(pattern = "^kurtosis|^skewness|^amplitude|^min|^max", colnames(train), value = T))
+nokeep <- unique(nokeep)
+
+l_d <- lapply(l_d, function(x){
+      keep <- colnames(x) %in% nokeep == 0
+      x1 <- x[,keep]
+      return(x1)
+})
+```
+
+After observing a relation between time and classe, I created new variables to explore this relation. Note that in mins_since_1, the starting point is the time of the first try IN THE TRAIN DATA SET.
+
+```{r create different time variables, echo=TRUE}
+l_d <- lapply(l_d, function(x){
+      x$date_time <- dmy_hm(x$cvtd_timestamp)
+      x$time <- paste(hour(x$date_time), minute(x$date_time), sep = ":")
+      x$time_n <- as.numeric(x$date_time - trunc(x$date_time, "days"))
+      return(x)
+})
+
+min <- tapply(l_d[["train"]]$date_time, l_d[["train"]]$user_name, function(x){
+      min(minute(x))
+})
+
+l_d <- lapply(l_d, function(x){
+     x$mins_since_1 <- NA
+     for(i in 1:length(min)){
+           x$mins_since_1[x$user_name == names(min)[i]] <- 
+                 minute(x$date_time[x$user_name == names(min)[i]]) - min[i]
+     } 
+     return(x)
+})
+```
+
+Then, I resplited the data sets.
+
+```{r}
+train <- l_d[["train"]]
+validation <- l_d[["validation"]]
+test <- l_d[["test"]]
+```
+
+Classe seems to be determined (partially) by the time that has passed since the first try. I included this information in the models.
+NOTE: I noticed this in the train data set NOT on the test set.
+
+```{r}
+ggplot(data = train, mapping = aes(x = user_name, fill = classe)) + 
+      facet_wrap(facets = ~mins_since_1)+
+      geom_bar()
+```
+
+THen, I registered multiple cores of my computer for parallelization. I also created different data sets that included different variables. That way I tested different models with different independent variablesa.
+
+```{r prepare parallel and prepare data sets}
+library(parallel) ; library(doParallel)
+cl <- makeCluster(4)
+registerDoParallel(cl)
+showConnections()
+clusterEvalQ(cl, library(caret))
+
+
+y_index <- grep("classe", colnames(train))
+
+#different x variables for models
+y <- train[,y_index]
+x1 <- train[,-c(y_index)] #all
+x2 <- train[,-c(y_index, 1)] #all - index "X"
+x3 <- train[,-c(y_index, 1, 3:5, 60:63)] #all - index "X" - time "raw_timestamp_part_1" "raw_timestamp_part_2" "cvtd_timestamp" "date_time" "time" "time_n"
+x4 <- train[,-c(y_index, 1, 3:5, 60:64)] #all - index "X" - time - mins "mins_since_1" 
+
+names_x <- c("x1", "x2", "x3", "x4")
+l_x <- list(x1, x2, x3, x4) ; names(l_x) <- names_x
+
+clusterExport(cl, list("y"))
+```
+
+After trying different models, I decided to do random forests (these had higher accuracy). Because the train data set has a lot of observations (and the random forests would take too long), i took and stratified sample based on classe, user_name and mins_since_1 and ran the models on these subset (2,000 obs).
+
+```{r random forest}
+library(dplyr)
+
+set.seed(144)
+subset <- train %>% 
+      group_by(user_name, mins_since_1, classe) %>% 
+      sample_frac(size = 2000/nrow(train))
+#grid.arrange(qplot(data = subset, x = mins_since_1, fill = classe, facets = ~user_name), qplot(data = train, x = mins_since_1, fill = classe, facets = ~user_name)) 
+
+sub_ids <- train$X %in% subset$X
+
+set.seed(114)
+system.time(mods_rf <- lapply(l_x, function(x){
+      train(classe~., data = data.frame("classe" = train$classe[sub_ids], x[sub_ids,]), method = "rf", prox = TRUE, 
+            trControl = trainControl(allowParallel =T, seeds = NA))
+}))
+
+preds_rf_train <- lapply(mods_rf, function(x){
+      predict(x, newdata = train)
+})
+```
+
+Checked the predictions in the train data set.
+
+```{r check rf}
+preds_rf_train_col <-  lapply( 1:length(preds_rf_train), function(x){
+      train$classe == preds_rf_train[[x]]
+})
+
+plot_rf_train <- lapply(1:length(l_x), function(x){
+      ggplot(data = train, mapping = aes(user_name, fill = preds_rf_train_col[[x]])) + geom_bar() +
+            facet_wrap(~classe) + 
+            ggtitle(names_x[x])
+})
+
+library(gridExtra)
+grid.arrange(plot_rf_train[[1]], plot_rf_train[[2]], plot_rf_train[[3]], plot_rf_train[[4]], ncol = 2)
+
+cm_rf_train <- lapply(preds_rf_train, function(x){
+      prop.table(confusionMatrix(x, train$classe)$table, margin = 2)*100
+})
+
+acc_rf_train <- sapply(preds_rf_train, function(x){
+      confusionMatrix(x, train$classe)$overall[1]
+})
+```
+
+THen, I tested the models on the validation data set.
+
+```{r test on validation}
+#validation
+
+preds_rf_valid <- lapply(mods_rf, function(x){
+      predict(x, newdata = validation)
+})
+
+cm_rf_valid <- lapply(preds_rf_valid, function(x){
+      prop.table(confusionMatrix(x, validation$classe)$table, margin = 2)*100
+})
+
+acc_rf_valid <- sapply(preds_rf_valid, function(x){
+      confusionMatrix(x, validation$classe)$overall[1]
+})
+
+cm_rf_valid # confusion matrix
+
+cbind(acc_rf_train, acc_rf_valid) #accuracy in train data set vs. accuracy in validation data set
+```
+
+I decided to apply only models x3 and x4 in the test set beacause they were the more parsimonious: x1 included the index variable (the data frame was ordered by classe so this would have caused overfitting) and x2 included many other variables that were highly related with mins_since_1. Both models generated the samepredictions. 
+
+```{r predict test}
+# ON TEST
+
+mods <- list(mods_rf[["x3"]], mods_rf[["x4"]])
+names(mods) = c("x3", "x4")
+
+preds_test <- lapply(mods, function(x){
+      predict(x, newdata = test)
+})
+
+lapply(preds_test, table)
+sum(preds_test[[1]] == preds_test[[2]])
+```
+
+Final predictions.
+
+```{r}
+test$classe_pred <- as.character(preds_test[["x3"]])
+cbind(test$X, test$classe_pred)
+```
+
+
+```{r}
+stopCluster(cl)
+registerDoSEQ()
+showConnections()
+```
+
